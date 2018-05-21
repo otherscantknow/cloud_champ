@@ -1,0 +1,751 @@
+/* This is the implemenation of the cloud Prefetcher.
+The functions and classes are defined at vldp.h.
+Implemented by: Samuel Pakalapati
+E-mail: pakalapatisamuel@gmail.com*/
+
+#include "cache.h"
+#include "cloud.h"
+
+uint64_t demand_misses=0;
+int ip_or_page[NUM_CPUS] = {0},page_count[NUM_CPUS] = {0}, ip_count[NUM_CPUS] = {0},num_accesses[NUM_CPUS] = {0};
+// int bloom_filter[NUM_BLOOM_ENTRIES],pref_degree = 3;
+// uint64_t pollution_avg=0, demand_avg=0, pollution_tot=0, demand_tot=0, evictions=0;
+
+DELTA_HISTORY_BUFFER L2_DHB[NUM_CPUS][NUM_DHB_REGIONS];
+DELTA_HISTORY_BUFFER_PAGE L2_DHBP[NUM_CPUS][NUM_DHB_REGIONS];
+PATTERN_TABLE L2_PT_1[NUM_CPUS][NUM_PT_ENTRIES];
+PATTERN_TABLE L2_PT_2[NUM_CPUS][NUM_PT_ENTRIES];
+PATTERN_TABLE L2_PT_3[NUM_CPUS][NUM_PT_ENTRIES];
+BLOOM_FILTER L2_BF[NUM_CPUS];
+
+int L2_DHB_update(uint32_t cpu,uint64_t addr, uint64_t ip )									// This is to update the delta history buffer
+{																				// Called when there is cache miss or prefetch hit
+	uint64_t ip_region = ip >> IP_REGION_SIZE,
+			 page_num = addr >> LOG2_PAGE_SIZE,
+			 match = 0,
+	    	 curr_block = (addr >> LOG2_BLOCK_SIZE) & 0x7FFF;
+	int64_t curr_delta = 0;
+	    DELTA_HISTORY_BUFFER *buffer = L2_DHB[cpu];
+
+	    for(match = 0; match < NUM_DHB_REGIONS; match++){
+	    	// if((buffer[match].num_access > 0) && (buffer[match].page_num == page_num) && (buffer[match].ip_region == ip_region)){ 		// DHB hit
+	    	if((buffer[match].num_access > 0) && (buffer[match].ip_region == ip_region)){
+	    		curr_delta = curr_block - ((buffer[match].last_addr >> LOG2_BLOCK_SIZE) & 0x7FFF);
+	    		if(curr_delta != 0){
+	    		for(int i=19; i>0; i--){												// Left shift the deltas
+	    			buffer[match].last_4_deltas[i] = buffer[match].last_4_deltas[i-1];
+	    			buffer[match].pages[i] = buffer[match].pages[i-1];
+	    			buffer[match].offsets[i] = buffer[match].offsets[i-1];
+	    			buffer[match].ips[i] = buffer[match].ips[i-1];	    			
+	    		}
+	    		buffer[match].last_4_deltas[0] = curr_delta;
+	    		buffer[match].pages[0] = page_num;
+	    		buffer[match].offsets[0] = curr_block;
+	    		buffer[match].ips[0] = ip;
+	    		buffer[match].count += 2;
+	    		// L2_DPT_update(cpu, addr, match);
+	    	}
+	    		break;
+	    	}
+	    }
+
+	    if(match == NUM_DHB_REGIONS)												// DHB miss
+	    	for(match=0; match<NUM_DHB_REGIONS; match++)
+	    		if(buffer[match].num_access == 0){								// Invalid entry, occurs at beginning
+	    			buffer[match].page_num = page_num;
+	    			buffer[match].ip_region = ip_region;
+	    			buffer[match].count = 2;
+	    			break;
+	    		}
+
+	    if(match == NUM_DHB_REGIONS)												// No DHB hits or no invalid entry found
+	    	for(match=0; match<NUM_DHB_REGIONS; match++)							// DHB miss
+	    		if(buffer[match].lru == (NUM_DHB_REGIONS-1)){						// evict LRU
+	    			buffer[match].page_num = page_num;
+	    			buffer[match].ip_region = ip_region;
+	    			buffer[match].last_pref_dpt_level = 1;
+					buffer[match].num_access = 0;	
+					buffer[match].count = 2;
+					for (int i=0; i<19; i++){
+						buffer[match].last_4_deltas[i] = 0;
+						buffer[match].pages[i] = 0;
+						buffer[match].offsets[i] = 0;
+						buffer[match].ips[i] = 0;}
+	    			break;
+	    		}
+
+	buffer[match].num_access++;													// Update last offset and num_access
+	buffer[match].last_addr = addr;
+
+
+	int position = buffer[match].lru;												// update lru
+    for (int j=0; j<NUM_DHB_REGIONS; j++) {
+        if (buffer[j].lru < position)
+            buffer[j].lru++;
+	}
+
+	buffer[match].lru = 0;
+
+if(match == NUM_DHB_REGIONS){
+	assert(0);	
+}
+
+
+	return match;
+}
+
+int L2_DHBP_update(uint32_t cpu,uint64_t addr, uint64_t ip )									// This is to update the delta history buffer
+{																				// Called when there is cache miss or prefetch hit
+	uint64_t ip_region = ip >> IP_REGION_SIZE,
+			 page_num = addr >> LOG2_PAGE_SIZE,
+			 match = 0,
+	    	 curr_block = (addr >> LOG2_BLOCK_SIZE) & 0x7FFF;
+	int64_t curr_delta = 0;
+	    DELTA_HISTORY_BUFFER_PAGE *buffer = L2_DHBP[cpu];
+	    
+	    for(match = 0; match < NUM_DHB_REGIONS; match++){
+	    	// if((buffer[match].num_access > 0) && (buffer[match].page_num == page_num) && (buffer[match].ip_region == ip_region)){ 		// DHB hit
+	    	if((buffer[match].num_access > 0) && (buffer[match].page_num == page_num)){
+	    		curr_delta = curr_block - ((buffer[match].last_addr >> LOG2_BLOCK_SIZE) & 0x7FFF);
+	    		if(curr_delta != 0){
+	    		for(int i=19; i>0; i--){												// Left shift the deltas
+	    			buffer[match].last_4_deltas[i] = buffer[match].last_4_deltas[i-1];
+	    			buffer[match].pages[i] = buffer[match].pages[i-1];
+	    			buffer[match].offsets[i] = buffer[match].offsets[i-1];
+	    			buffer[match].ips[i] = buffer[match].ips[i-1];	    			
+	    		}
+	    		buffer[match].last_4_deltas[0] = curr_delta;
+	    		buffer[match].pages[0] = page_num;
+	    		buffer[match].offsets[0] = curr_block;
+	    		buffer[match].ips[0] = ip;
+	    		buffer[match].count += 1;
+	    		L2_DPT_update(cpu, addr, match);
+	    	}
+	    		break;
+	    	}
+	    }
+
+	    if(match == NUM_DHB_REGIONS)												// DHB miss
+	    	for(match=0; match<NUM_DHB_REGIONS; match++)
+	    		if(buffer[match].num_access == 0){								// Invalid entry, occurs at beginning
+	    			buffer[match].page_num = page_num;
+	    			buffer[match].ip_region = ip_region;
+	    			buffer[match].count = 1;
+	    			break;
+	    		}
+
+	    if(match == NUM_DHB_REGIONS)												// No DHB hits or no invalid entry found
+	    	for(match=0; match<NUM_DHB_REGIONS; match++)							// DHB miss
+	    		if(buffer[match].lru == (NUM_DHB_REGIONS-1)){						// evict LRU
+	    			buffer[match].page_num = page_num;
+	    			buffer[match].ip_region = ip_region;
+	    			buffer[match].last_pref_dpt_level = 1;
+					buffer[match].num_access = 0;
+					buffer[match].count = 1;	
+					for (int i=0; i<19; i++){
+						buffer[match].last_4_deltas[i] = 0;
+						buffer[match].pages[i] = 0;
+						buffer[match].offsets[i] = 0;
+						buffer[match].ips[i] = 0;}
+	    			break;
+	    		}
+
+	buffer[match].num_access++;													// Update last offset and num_access
+	buffer[match].last_addr = addr;
+
+
+	int position = buffer[match].lru;												// update lru
+    for (int j=0; j<NUM_DHB_REGIONS; j++) {
+        if (buffer[j].lru < position)
+            buffer[j].lru++;
+	}
+	buffer[match].lru = 0;
+
+if(match == NUM_DHB_REGIONS){
+	assert(0);	
+}
+
+
+	return match;
+}
+
+void L2_promote(uint32_t cpu, int entry, int table_num){
+	int match = -1, j=-1, position;
+	PATTERN_TABLE *table_1 = L2_PT_1[cpu];
+	PATTERN_TABLE *table_2 = L2_PT_2[cpu];
+	PATTERN_TABLE *table_3 = L2_PT_3[cpu];
+	// DELTA_HISTORY_BUFFER *buffer = L2_DHB[cpu];
+
+	// if(ip_or_page[cpu])
+		DELTA_HISTORY_BUFFER_PAGE *buffer = L2_DHBP[cpu];
+
+//DPT_2
+if(table_num == 2){
+	for(match=0; match<NUM_PT_ENTRIES; match++)
+		if(table_2[match].deltas[0] == buffer[entry].last_4_deltas[1] &&
+			table_2[match].deltas[1] == buffer[entry].last_4_deltas[2]){		// DPT_2 hit
+			if(table_2[match].pred_delta == buffer[entry].last_4_deltas[0]){	// Correct prediction
+				table_2[match].accuracy++;
+				if(table_2[match].accuracy > 3)
+					table_2[match].accuracy = 3;								// 2-bit accuracy
+				break;
+			}			
+			else{																// Wrong prediction
+				table_2[match].accuracy--;
+				if(table_2[match].accuracy == 0){								// If accuracy 0, promote
+					table_2[match].pred_delta = buffer[entry].last_4_deltas[0];
+					buffer[entry].last_pref_dpt_level = 3;						// promote to DPT_3
+					table_2[match].accuracy = 1;
+				}
+				break;
+			}
+
+		}
+	if(match == NUM_PT_ENTRIES)												// If not hit, search for invalid entry
+		for(match=0; match<NUM_PT_ENTRIES; match++)
+			if(table_2[match].pred_delta == 0){									// Invalid entry found
+				table_2[match].deltas[0] = buffer[entry].last_4_deltas[1];
+				table_2[match].deltas[1] = buffer[entry].last_4_deltas[2];
+				table_2[match].pred_delta = buffer[entry].last_4_deltas[0];
+				table_2[match].accuracy = 1;
+				break;
+			}
+	if(match == NUM_PT_ENTRIES)												// Search for nMRU candidate
+		for(match=0; match<NUM_PT_ENTRIES; match++)
+			if(table_2[match].lru == (NUM_PT_ENTRIES-1)){										// Evict nMRU
+				table_2[match].deltas[0] = buffer[entry].last_4_deltas[1];
+				table_2[match].deltas[1] = buffer[entry].last_4_deltas[2];
+				table_2[match].pred_delta = buffer[entry].last_4_deltas[0];
+				table_2[match].accuracy = 1;
+				break;
+			}
+
+			position = table_2[match].lru;												// update lru
+		    for (int j=0; j<NUM_PT_ENTRIES; j++){
+		        if (table_2[j].lru < position)
+		            table_2[j].lru++;
+			}
+		table_2[match].lru = 0;														// Make MRU
+	}
+
+
+	if(table_num == 3){
+	for(match=0; match<NUM_PT_ENTRIES; match++)
+		if(table_3[match].deltas[0] == buffer[entry].last_4_deltas[1] &&
+			table_3[match].deltas[1] == buffer[entry].last_4_deltas[2] &&
+			table_3[match].deltas[2] == buffer[entry].last_4_deltas[3]){		// DPT_2 hit
+			if(table_3[match].pred_delta == buffer[entry].last_4_deltas[0]){	// Correct prediction
+				table_3[match].accuracy++;
+				if(table_3[match].accuracy > 3)
+					table_3[match].accuracy = 3;								// 2-bit accuracy
+				break;
+			}			
+			else{																// Wrong prediction
+				table_3[match].accuracy--;
+				if(table_3[match].accuracy == 0){								// If accuracy 0, update
+					table_3[match].pred_delta = buffer[entry].last_4_deltas[0];
+					table_3[match].accuracy = 1;
+				}
+				break;
+			}
+
+		}
+	if(match == NUM_PT_ENTRIES)												// If not hit, search for invalid entry
+		for(match=0; match<NUM_PT_ENTRIES; match++)
+			if(table_3[match].pred_delta == 0){									// Invalid entry found
+				table_3[match].deltas[0] = buffer[entry].last_4_deltas[1];
+				table_3[match].deltas[1] = buffer[entry].last_4_deltas[2];
+				table_3[match].deltas[2] = buffer[entry].last_4_deltas[3];
+				table_3[match].pred_delta = buffer[entry].last_4_deltas[0];
+				table_3[match].accuracy = 1;
+				break;
+			}
+	if(match == NUM_PT_ENTRIES)												// Search for nMRU candidate
+		for(match=0; match<NUM_PT_ENTRIES; match++)
+			if(table_3[match].lru == (NUM_PT_ENTRIES-1)){										// Evict nMRU
+				table_3[match].deltas[0] = buffer[entry].last_4_deltas[1];
+				table_3[match].deltas[1] = buffer[entry].last_4_deltas[2];
+				table_3[match].deltas[2] = buffer[entry].last_4_deltas[3];
+				table_3[match].pred_delta = buffer[entry].last_4_deltas[0];
+				table_3[match].accuracy = 1;
+				break;
+			}
+
+	position = table_3[match].lru;												// update lru
+		    for (int j=0; j<NUM_PT_ENTRIES; j++){
+		        if (table_3[j].lru < position)
+		            table_3[j].lru++;
+			}
+		table_3[match].lru = 0;														// Make MRU
+	}
+
+
+}
+
+void L2_DPT_update(uint32_t cpu,uint64_t addr, int entry){						// Update the delta prefetch table
+	int match = -1,j=-1,position;
+	PATTERN_TABLE *table_1 = L2_PT_1[cpu];
+	PATTERN_TABLE *table_2 = L2_PT_2[cpu];
+	PATTERN_TABLE *table_3 = L2_PT_3[cpu];
+	// DELTA_HISTORY_BUFFER *buffer = L2_DHB[cpu];
+
+	// if(ip_or_page[cpu])
+		DELTA_HISTORY_BUFFER_PAGE *buffer = L2_DHBP[cpu];
+
+	if(buffer[entry].last_pref_dpt_level == 3){
+		for(match=0; match<NUM_PT_ENTRIES; match++)
+			if(table_3[match].deltas[0] == buffer[entry].last_4_deltas[1] &&
+				table_3[match].deltas[1] == buffer[entry].last_4_deltas[2] &&
+				table_3[match].deltas[2] == buffer[entry].last_4_deltas[3]){		// DPT_2 hit
+				if(table_3[match].pred_delta == buffer[entry].last_4_deltas[0]){	// Correct prediction
+					table_3[match].accuracy++;
+					if(table_3[match].accuracy > 3)
+						table_3[match].accuracy = 3;								// 2-bit accuracy
+					break;
+				}			
+				else{																// Wrong prediction
+					table_3[match].accuracy--;
+					if(table_3[match].accuracy < 0)
+						table_3[match].accuracy = 0;
+					if(table_3[match].accuracy == 0){								// If accuracy 0, update
+						table_3[match].pred_delta = buffer[entry].last_4_deltas[0];
+						table_3[match].accuracy = 1;
+					}
+					break;
+				}
+
+			}
+		if(match == NUM_PT_ENTRIES)												// If not hit, search for invalid entry
+			buffer[entry].last_pref_dpt_level--;
+		else{
+			position = table_3[match].lru;												// update lru
+		    for (int j=0; j<NUM_PT_ENTRIES; j++) {
+		        if (table_3[j].lru < position)
+		            table_3[j].lru++;
+			}
+
+		table_3[match].lru = 0;
+		}
+																// Make MRU
+	}
+		
+	if(buffer[entry].last_pref_dpt_level == 2){
+		for(match=0; match<NUM_PT_ENTRIES; match++)
+			if(table_2[match].deltas[0] == buffer[entry].last_4_deltas[1] &&
+				table_2[match].deltas[1] == buffer[entry].last_4_deltas[2]){		// DPT_2 hit
+				if(table_2[match].pred_delta == buffer[entry].last_4_deltas[0]){	// Correct prediction
+					table_2[match].accuracy++;
+					if(table_2[match].accuracy > 3)
+						table_2[match].accuracy = 3;								// 2-bit accuracy
+					break;
+				}			
+				else{																// Wrong prediction
+					table_2[match].accuracy--;
+					if(table_2[match].accuracy == 0){								// If accuracy 0, promote
+						table_2[match].pred_delta = buffer[entry].last_4_deltas[0];
+						buffer[entry].last_pref_dpt_level = 3;						// promote to DPT_3
+						L2_promote(cpu, entry, 3);
+						table_2[match].accuracy = 1;
+					}
+					break;
+				}
+
+			}
+		if(match == NUM_PT_ENTRIES)												// If not hit, search for invalid entry
+			buffer[entry].last_pref_dpt_level--;
+		else{
+			position = table_2[match].lru;												// update lru
+		    for (int j=0; j<NUM_PT_ENTRIES; j++) {
+		        if (table_2[j].lru < position)
+		            table_2[j].lru++;
+			}
+
+		table_2[match].lru = 0;
+		}													// Make MRU
+}
+
+
+	if(buffer[entry].last_pref_dpt_level == 1){											// Start with level 1 DPT
+		for(match=0; match<NUM_PT_ENTRIES; match++)
+			if(table_1[match].deltas[0] == buffer[entry].last_4_deltas[1]){				// DPT_1 hit
+				if(table_1[match].pred_delta == buffer[entry].last_4_deltas[0]){		// Correct prediction
+					table_1[match].accuracy++;
+					if(table_1[match].accuracy > 3)
+						table_1[match].accuracy = 3;									// 2-bit accuracy
+					break;
+				}			
+				else{																	// Wrong prediction
+					table_1[match].accuracy--;											
+					if(table_1[match].accuracy == 0){									// If accuracy 0, promote
+						table_1[match].pred_delta = buffer[entry].last_4_deltas[0];
+						buffer[entry].last_pref_dpt_level = 2;							// promote to DPT_2
+						L2_promote(cpu, entry, 2);
+						table_1[match].accuracy = 1;
+					}
+					break;
+				}
+
+			}
+		if(match == NUM_PT_ENTRIES)												// If not hit, search for invalid entry
+			for(match=0; match<NUM_PT_ENTRIES; match++)
+				if(table_1[match].pred_delta == 0){									// Invalid entry found
+					table_1[match].deltas[0] = buffer[entry].last_4_deltas[1];
+					table_1[match].pred_delta = buffer[entry].last_4_deltas[0];
+					table_1[match].accuracy = 1;
+					break;
+				}
+		if(match == NUM_PT_ENTRIES)												// Search for nMRU candidate
+			for(match=0; match<NUM_PT_ENTRIES; match++)
+				if(table_1[match].lru == (NUM_PT_ENTRIES-1)){										// Evict nMRU
+					table_1[match].deltas[0] = buffer[entry].last_4_deltas[1];
+					table_1[match].pred_delta = buffer[entry].last_4_deltas[0];
+					table_1[match].accuracy = 1;
+					break;
+				}
+
+		position = table_1[match].lru;												// update lru
+		    for (int j=0; j<NUM_PT_ENTRIES; j++) {
+		        if (table_1[j].lru < position)
+		            table_1[j].lru++;
+			}
+
+		table_1[match].lru = 0;													// Make MRU
+		}
+
+	if(match == NUM_PT_ENTRIES)
+	assert(0);	
+// if(table[match].lru == (NUM_PT_ENTRIES-1)){	
+}
+
+delta_and_acc L2_DPT_check(uint32_t cpu, int *delta, int entry){											// Search DPT for delta
+	int i;
+	PATTERN_TABLE *table_1 = L2_PT_1[cpu];
+	PATTERN_TABLE *table_2 = L2_PT_2[cpu];
+	PATTERN_TABLE *table_3 = L2_PT_3[cpu];
+	// DELTA_HISTORY_BUFFER *buffer = L2_DHB[cpu];
+
+	// if(ip_or_page[cpu])
+		DELTA_HISTORY_BUFFER_PAGE *buffer = L2_DHBP[cpu];
+
+for(i=0; i<NUM_PT_ENTRIES; i++)
+	if(table_3[i].deltas[0] == delta[0] && table_3[i].deltas[0] !=0 &&
+		table_3[i].deltas[1] == delta[1] &&	table_3[i].deltas[1] !=0 &&					// Priority given to 3-delta DPT first
+		table_3[i].deltas[2] == delta[2] && table_3[i].deltas[2] !=0 ){
+		L2_PF_DEBUG(printf("3_Delta = %d,%d,%d:%d\n", 
+								delta[2], delta[1], delta[0], table_3[i].pred_delta));
+		buffer[entry].last_pref_dpt_level = 3;
+		return {table_3[i].pred_delta, 3};}	
+
+for(i=0; i<NUM_PT_ENTRIES; i++)
+	if(table_2[i].deltas[0] == delta[0] && table_2[i].deltas[0] != 0 &&
+		table_2[i].deltas[1] == delta[1] && table_2[i].deltas[1] != 0 &&
+		table_2[i].pred_delta != 0){
+		// && table_2[i].accuracy > 1){					
+		L2_PF_DEBUG(printf("PT_2: %ld %ld %ld %lx %d\n", table_2[i].deltas[1], table_2[i].deltas[0],
+				table_2[i].pred_delta ,table_2[i].accuracy, i));
+	buffer[entry].last_pref_dpt_level = 2;
+	// printf("using table 2\n");
+	return {table_2[i].pred_delta ,table_2[i].accuracy,2};
+	}
+
+for(i=0; i<NUM_PT_ENTRIES; i++)
+	if(table_1[i].deltas[0] == delta[0] && table_1[i].deltas[0] != 0 &&
+		table_1[i].pred_delta != 0){
+		// && table_1[i].accuracy > 1){					
+		L2_PF_DEBUG(printf("PT_1: %ld %ld %ld %lx %d\n", table_1[i].deltas[1], table_1[i].deltas[0],
+				table_1[i].pred_delta ,table_1[i].accuracy, i));
+	buffer[entry].last_pref_dpt_level = 1;
+	// printf("using table 1\n");
+	return {table_1[i].pred_delta ,table_1[i].accuracy,1};
+	}												// Return pt delta
+L2_PF_DEBUG(printf("No delta predicted\n"));
+	return {PREF_ERROR,0,0};															// Else return prefetch error
+}
+
+uint64_t hash_bloom(uint64_t addr){
+	uint64_t first_half, sec_half;
+	first_half = addr & 0xFFF;
+	sec_half = (addr >> 12) & 0xFFF;
+	return (first_half ^ sec_half);
+}
+/*
+void L2_PF_UPDATE(uint32_t cpu, uint64_t cl, int prefetch){
+	PREFETCH_FILTER *filter = L2_PF[cpu];
+	uint64_t index = cl & 0x1FF,
+			 tag = cl >> 9;
+
+	if(prefetch){
+		filter[index].tag = tag;
+		filter[index].valid = 1;
+	}
+	else{
+		if(filter[index].tag == tag)
+			filter[index].valid = 0;
+	}
+}
+
+int L2_PF_CHECK(uint32_t cpu, uint64_t cl){
+	PREFETCH_FILTER *filter = L2_PF[cpu];
+	uint64_t index = cl & 0x1FF,
+			 tag = cl >> 9;
+
+	if(filter[index].tag == tag && filter[index].valid == 1)
+		return 0;
+	else
+		return 1;
+
+}
+*/
+void CACHE::l2c_prefetcher_initialize() 
+{
+	cout << endl << "L2C Cloud Prefetcher" << endl;
+		for(int i=0; i<NUM_DHB_REGIONS; i++)
+			L2_DHB[cpu][i].lru = i;
+		for(int i=0; i<NUM_DHB_REGIONS; i++)
+			L2_DHBP[cpu][i].lru = i;
+		for(int i=0; i<NUM_PT_ENTRIES; i++)
+			L2_PT_1[cpu][i].lru = i;
+		for(int i=0; i<NUM_PT_ENTRIES; i++)
+			L2_PT_2[cpu][i].lru = i;
+		for(int i=0; i<NUM_PT_ENTRIES; i++)
+			L2_PT_3[cpu][i].lru = i;
+		for(int i=0; i<NUM_BLOOM_ENTRIES; i++)
+			L2_BF[cpu].b_filter[i] = 0;
+}
+
+void CACHE::l2c_prefetcher_operate(uint64_t addr, uint64_t ip, uint8_t cache_hit, uint8_t type)
+{
+
+	int delta[4],
+		dhb_entry,
+		dpt_entry,
+		pred_delta,
+		i, j, flag = 0;
+	delta_and_acc delt;
+	uint64_t curr_page = addr >> LOG2_PAGE_SIZE,
+			 pref_page,
+			 curr_block = (addr >> LOG2_BLOCK_SIZE) & 0x7FFF,
+			 pref_block = 0,
+			 pref_addr,
+			 temp_addr,
+			 orig_addr = addr,
+			 last_4_blocks[4],
+			 ip_region = ip >> IP_REGION_SIZE,
+			 pf_index, pf_tag, bloom_index;
+	float pollution = 0, accuracy = 0;
+	DELTA_HISTORY_BUFFER *buffer = L2_DHB[cpu];
+	DELTA_HISTORY_BUFFER_PAGE *buffer_page = L2_DHBP[cpu];
+	PATTERN_TABLE *table_1 = L2_PT_1[cpu];
+	PATTERN_TABLE *table_2 = L2_PT_2[cpu];
+	// BLOOM_FILTER *filter = L2_BF[cpu];
+
+if(cache_hit == 0){
+	L2_BF[cpu].misses++;
+	demand_misses++;
+	bloom_index = hash_bloom(addr >> LOG2_BLOCK_SIZE);
+	if(L2_BF[cpu].b_filter[bloom_index] == 1){
+		L2_BF[cpu].pollution_tot++;
+		L2_BF[cpu].b_filter[bloom_index] = 0;
+	}
+	L2_BF[cpu].demand_tot++;
+	if(L2_BF[cpu].evictions >= 4096){
+		L2_BF[cpu].evictions = 0;
+		L2_BF[cpu].pollution_avg = (L2_BF[cpu].pollution_avg/2) + (L2_BF[cpu].pollution_tot/2);
+		L2_BF[cpu].demand_avg = (L2_BF[cpu].demand_avg/2) + (L2_BF[cpu].demand_tot/2);
+		pollution = (float)L2_BF[cpu].pollution_avg/L2_BF[cpu].demand_avg;
+		L2_BF[cpu].pollution_tot = 0;
+		L2_BF[cpu].demand_tot = 0;
+		// if(pollution > 0.4)
+		// 	L2_BF[cpu].pref_degree = 0;
+		// else if(pollution > 0.3 && pollution < 0.4)
+		// 	L2_BF[cpu].pref_degree = 1;
+		// else
+		// 	L2_BF[cpu].pref_degree = 3;
+		// printf("pollution = %f\n", pollution);
+	}
+	// printf("poll = %d dem = %d\n", L2_BF[cpu].pollution_tot, L2_BF[cpu].demand_tot);
+}
+else{
+	bloom_index = hash_bloom(addr >> LOG2_BLOCK_SIZE);
+	if(L2_BF[cpu].a_filter[bloom_index] == 1){
+		L2_BF[cpu].used_tot++;
+		L2_BF[cpu].a_filter[bloom_index] = 0;
+	}
+	if(L2_BF[cpu].misses >= 4096){
+		L2_BF[cpu].misses = 0;
+		L2_BF[cpu].used_avg = (L2_BF[cpu].used_avg/2) + (L2_BF[cpu].used_tot/2);
+		L2_BF[cpu].prefetches_avg = (L2_BF[cpu].prefetches_avg/2) + (L2_BF[cpu].prefetches_tot/2);
+		accuracy = (float)L2_BF[cpu].used_avg/L2_BF[cpu].prefetches_avg;
+		L2_BF[cpu].used_tot = 0;
+		L2_BF[cpu].prefetches_tot = 0;
+		if(accuracy > 0.4)
+			L2_BF[cpu].pref_degree = 15;
+		else if(accuracy > 0.2 && accuracy < 0.4)
+			L2_BF[cpu].pref_degree = 7;
+		else
+			L2_BF[cpu].pref_degree = 1;
+		// printf("accuracy = %f\n", accuracy);
+	}
+}
+int ip_match, page_match;
+
+	// dhb_entry = L2_DHB_update( cpu, addr, ip);
+// ip_match = L2_DHB_update( cpu, addr, ip);
+page_match = L2_DHBP_update( cpu, addr, ip);
+
+// printf("%d %d\n", buffer[ip_match].count, buffer_page[page_match].count);
+
+if(buffer[ip_match].count >= buffer_page[page_match].count){
+	ip_count[cpu]++;	
+}
+else{
+	page_count[cpu]++;	
+}
+
+num_accesses[cpu]++;
+if(num_accesses[cpu]>= 4096){
+	if(ip_count[cpu]>page_count[cpu])
+		ip_or_page[cpu] = 0;
+	else
+		ip_or_page[cpu] = 1;
+	num_accesses[cpu] = 0;
+	ip_count[cpu] = 0;
+	page_count[cpu] = 0;
+}
+
+ip_or_page[cpu] = 1;
+// if(ip_or_page[cpu]){
+if(1){
+	dhb_entry = page_match;
+	for(i=0; i<4; i++)
+		delta[i] = buffer_page[dhb_entry].last_4_deltas[i];
+	if(buffer_page[page_match].num_access == 1)
+		return;
+}
+else{
+	dhb_entry = ip_match;
+	for(i=0; i<4; i++)
+		delta[i] = buffer[dhb_entry].last_4_deltas[i];
+	if(buffer[ip_match].num_access == 1)
+		return;
+}
+
+	// L2_DPT_update(cpu,addr,dhb_entry);
+
+	L2_PF_DEBUG(printf("DHB: %lx %lx ", buffer[dhb_entry].ip_region,
+			buffer[dhb_entry].page_num));
+	L2_PF_DEBUG(for(i=19; i>=0; i--) printf("%ld ", buffer[dhb_entry].last_4_deltas[i]);
+					printf("\n"));
+	L2_PF_DEBUG(for(i=19; i>=0; i--) printf("%ld ", buffer[dhb_entry].pages[i]);
+					printf("\n"));
+	L2_PF_DEBUG(for(i=19; i>=0; i--) printf("%ld ", buffer[dhb_entry].offsets[i]);
+					printf("\n"));
+
+	
+
+	// if(buffer[ip_match].num_access == 1){
+	// 	if(buffer_page[page_match].num_access == 1)
+	// 		return;
+	// 	else
+	// 		for(i=0; i<4; i++)
+	// 			delta[i] = buffer_page[page_match].last_4_deltas[i];
+	// }
+	// else if(buffer_page[page_match].num_access == 1){
+	// 		for(i=0; i<4; i++)
+	// 				delta[i] = buffer[ip_match].last_4_deltas[i];}
+	// else{
+		// pred_delta = 0;
+		delt = L2_DPT_check( cpu, delta, dhb_entry);							// DPT check
+		pred_delta = delt.delta;
+		if(pred_delta == PREF_ERROR)
+			return;
+		pref_addr = ((addr >> LOG2_BLOCK_SIZE) + pred_delta) << LOG2_BLOCK_SIZE;
+		pref_block = (pref_addr >> LOG2_BLOCK_SIZE) & 0x7FFF;
+		pref_page = pref_addr >> LOG2_PAGE_SIZE;
+		if(pred_delta == PREF_ERROR || pref_page != curr_page)						// pred_delta not found
+			return;
+		// if(L2_PF_CHECK(cpu, pref_block)){
+		if (MSHR.occupancy < (MSHR.SIZE>>1))
+                prefetch_line(ip, addr, pref_addr, FILL_L2);
+            else
+                prefetch_line(ip, addr, pref_addr, FILL_LLC);
+			// prefetch_line(ip, addr, pref_addr, FILL_L2);
+			// L2_PF_UPDATE(cpu, pref_addr >> LOG2_BLOCK_SIZE, 1);
+		// }
+	// }
+	for(i=3; i>0; i--){
+		delta[i] = delta[i-1];														// Store pred_delta
+	}
+	delta[0] = pred_delta;
+	curr_block = pref_block;														// Update curr_block fro further prefetches
+
+// return;
+
+
+for(j=0; j<L2_BF[cpu].pref_degree; j++){
+// for(j=0; j<3; j++){
+	pred_delta = 0;
+	delt = L2_DPT_check( cpu, delta, dhb_entry);							// DPT check
+	pred_delta = delt.delta;
+	if(pred_delta == PREF_ERROR)
+		return;
+	pref_addr = ((pref_addr >> LOG2_BLOCK_SIZE) + pred_delta) << LOG2_BLOCK_SIZE;
+	pref_block = (pref_addr >> LOG2_BLOCK_SIZE) & 0x7FFF;
+	pref_page = pref_addr >> LOG2_PAGE_SIZE;
+	// if((pred_delta == PREF_ERROR || pref_page != curr_page || delt.dpt != 2))			// If pred_delta not found, return
+	if((pred_delta == PREF_ERROR || pref_page != curr_page))			// If pred_delta not found, return
+	return;
+	{
+	// if(L2_PF_CHECK(cpu, pref_block)){
+			if (MSHR.occupancy < (MSHR.SIZE>>1))
+                prefetch_line(ip, addr, pref_addr, FILL_L2);
+            else
+                prefetch_line(ip, addr, pref_addr, FILL_LLC);
+		// prefetch_line(ip, addr, pref_addr, FILL_L2);
+		// L2_PF_UPDATE(cpu, pref_addr >> LOG2_BLOCK_SIZE, 1);
+	// }
+}
+	for(i=3; i>0; i--){
+		delta[i] = delta[i-1];														// Update delta array
+	}
+	delta[0] = pred_delta;
+	curr_block = pref_block;														// Update current_block
+	// addr = pref_addr;																// Update addr
+	}	
+
+return;
+}
+
+void CACHE::l2c_prefetcher_cache_fill(uint64_t addr, uint32_t set, uint32_t way, uint8_t prefetch, uint64_t evicted_addr)
+{
+
+	uint64_t evicted_block = evicted_addr >> LOG2_BLOCK_SIZE,
+			 block = addr >> LOG2_BLOCK_SIZE,
+			 index;
+	// BLOOM_FILTER *filter = L2_BF[cpu];
+
+	// L2_PF_UPDATE(cpu, evicted_block, 0);
+	if(prefetch){
+		if(evicted_block){
+			index = hash_bloom(evicted_block);
+			L2_BF[cpu].b_filter[index] = 1;
+			L2_BF[cpu].evictions++;
+		}
+		if(block){
+			index = hash_bloom(block);
+			L2_BF[cpu].b_filter[index] = 0;
+			L2_BF[cpu].a_filter[index] = 1;
+			L2_BF[cpu].prefetches_tot++;
+		}
+	}
+
+	if(evicted_block){
+		index = hash_bloom(evicted_block);
+		L2_BF[cpu].a_filter[index] = 0;
+	}
+}
+
+void CACHE::l2c_prefetcher_final_stats()
+{
+	cout << endl << "L2C Cloud Prefetcher final stats: ip = "<< ip_count[cpu] << " demand_misses = " << demand_misses << endl;
+}

@@ -36,8 +36,8 @@
 #define NUM_CPUS 1
 #define CPU_FREQ 4000
 #define DRAM_IO_FREQ 800
-#define PAGE_SIZE 4096
-#define LOG2_PAGE_SIZE 12
+#define PAGE_SIZE 2097152
+#define LOG2_PAGE_SIZE 21
 
 // CACHE
 #define BLOCK_SIZE 64
